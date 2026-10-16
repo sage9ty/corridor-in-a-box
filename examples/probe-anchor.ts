@@ -7,17 +7,30 @@
 // attestation submitted on chain must be produced by exactly the logic you can
 // inspect here.
 
-import { decodeProbes, decodeSeps, probeAnchor } from "@corridor/probe";
+import {
+  decodeProbes,
+  decodeSeps,
+  formatProbeResultJson,
+  parseProbeArgs,
+  probeAnchor,
+} from "@corridor/probe";
 
 async function main(): Promise<void> {
-  const domain = process.argv[2];
+  const { domain, json } = parseProbeArgs(process.argv.slice(2));
   if (!domain) {
-    console.error("usage: pnpm probe:anchor <home-domain>");
+    console.error("usage: pnpm probe:anchor <home-domain> [--json]");
     process.exit(2);
   }
 
-  console.log(`probing ${domain}\n`);
+  if (!json) {
+    console.log(`probing ${domain}\n`);
+  }
   const r = await probeAnchor(domain);
+
+  if (json) {
+    console.log(formatProbeResultJson(r));
+    return;
+  }
 
   for (const o of r.outcomes) {
     console.log(`  ${o.passed ? "✓" : "✗"} ${o.probe.padEnd(13)} ${o.detail}`);

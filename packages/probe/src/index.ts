@@ -271,3 +271,51 @@ export async function probeAnchor(
 
   return { domain, seps, probesRun, probesPassed, tomlHash, outcomes };
 }
+
+export interface FormattedProbeResultJson {
+  readonly domain: string;
+  readonly tomlHash: string;
+  readonly outcomes: readonly ProbeOutcome[];
+  readonly seps: readonly SepNumber[];
+  readonly probesPassed: readonly ProbeName[];
+  readonly probesRun: readonly ProbeName[];
+  readonly raw: {
+    readonly seps: number;
+    readonly probesRun: number;
+    readonly probesPassed: number;
+  };
+}
+
+/**
+ * Format a ProbeResult into a clean JSON string with decoded SEP numbers and probe names.
+ */
+export function formatProbeResultJson(result: ProbeResult): string {
+  const data: FormattedProbeResultJson = {
+    ...result,
+    seps: decodeSeps(result.seps),
+    probesPassed: decodeProbes(result.probesPassed),
+    probesRun: decodeProbes(result.probesRun),
+    raw: {
+      seps: result.seps,
+      probesRun: result.probesRun,
+      probesPassed: result.probesPassed,
+    },
+  };
+  return JSON.stringify(data, null, 2);
+}
+
+/**
+ * Parse CLI arguments for probe:anchor, extracting domain and --json flag.
+ */
+export function parseProbeArgs(args: readonly string[]): { domain?: string; json: boolean } {
+  let domain: string | undefined;
+  let json = false;
+  for (const arg of args) {
+    if (arg === "--json") {
+      json = true;
+    } else if (!arg.startsWith("-") && !domain) {
+      domain = arg;
+    }
+  }
+  return { domain, json };
+}
