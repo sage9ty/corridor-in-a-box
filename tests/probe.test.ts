@@ -13,13 +13,16 @@ import {
 import {
   decodeProbes,
   decodeSeps,
+  formatProbeResultJson,
   isSafeUrl,
+  parseProbeArgs,
   probeAnchor,
   probeBit,
   sepBit,
   tomlHash as sharedTomlHash,
   tomlValue,
   type ProbeName,
+  type ProbeResult,
 } from "@corridor/probe";
 
 const PASSPHRASE = Networks.TESTNET;
@@ -356,5 +359,66 @@ describe("probeAnchor", () => {
     const sep31 = r.outcomes.find((o) => o.probe === "sep31_info");
     expect(sep31?.passed).toBe(false);
     expect(sep31?.detail).toContain("EMPTY");
+  });
+});
+
+describe("formatProbeResultJson & parseProbeArgs (#232)", () => {
+  describe("parseProbeArgs", () => {
+    it("parses domain when provided as single argument", () => {
+      const res = parseProbeArgs(["testanchor.stellar.org"]);
+      expect(res).toEqual({ domain: "testanchor.stellar.org", json: false });
+    });
+
+    it("parses --json when placed after domain", () => {
+      const res = parseProbeArgs(["testanchor.stellar.org", "--json"]);
+      expect(res).toEqual({ domain: "testanchor.stellar.org", json: true });
+    });
+
+    it("parses --json when placed before domain", () => {
+      const res = parseProbeArgs(["--json", "testanchor.stellar.org"]);
+      expect(res).toEqual({ domain: "testanchor.stellar.org", json: true });
+    });
+
+    it("returns undefined domain when only --json is passed", () => {
+      const res = parseProbeArgs(["--json"]);
+      expect(res).toEqual({ domain: undefined, json: true });
+    });
+
+    it("returns undefined domain when argv is empty", () => {
+      const res = parseProbeArgs([]);
+      expect(res).toEqual({ domain: undefined, json: false });
+    });
+  });
+
+  describe("formatProbeResultJson", () => {
+    const fixture: ProbeResult = {
+      domain: "example.org",
+      seps: sepBit(1) | sepBit(10) | sepBit(31) | sepBit(38),
+      probesRun: probeBit("toml_fetch") | probeBit("sep10_auth") | probeBit("sep31_info"),
+      probesPassed: probeBit("toml_fetch") | probeBit("sep10_auth"),
+      tomlHash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+      outcomes: [
+        { probe: "toml_fetch", passed: true, detail: "stellar.toml fetched" },
+        { probe: "sep10_auth", passed: true, detail: "signed challenge verified" },
+        { probe: "sep31_info", passed: false, detail: "receive list is EMPTY" },
+      ],
+    };
+
+    it("serializes fixture into valid JSON with decoded seps and probes", () => {
+      const jsonStr = formatProbeResultJson(fixture);
+      const parsed = JSON.parse(jsonStr);
+
+      expect(parsed.domain).toBe("example.org");
+      expect(parsed.tomlHash).toBe(fixture.tomlHash);
+      expect(parsed.outcomes).toEqual(fixture.outcomes);
+      expect(parsed.seps).toEqual([1, 10, 31, 38]);
+      expect(parsed.probesRun).toEqual(["toml_fetch", "sep10_auth", "sep31_info"]);
+      expect(parsed.probesPassed).toEqual(["toml_fetch", "sep10_auth"]);
+      expect(parsed.raw).toEqual({
+        seps: fixture.seps,
+        probesRun: fixture.probesRun,
+        probesPassed: fixture.probesPassed,
+      });
+    });
   });
 });

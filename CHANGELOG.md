@@ -7,6 +7,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — `--json` flag to `pnpm probe:anchor` (#232)
+
+- Adds `--json` flag parsing to `examples/probe-anchor.ts` accepted in any argv position.
+- Suppresses banner and human logs when `--json` is supplied, streaming only the serialized JSON probe result to stdout.
+- Introduces `formatProbeResultJson` and `parseProbeArgs` in `@corridor/probe`, formatting raw bitmasks alongside decoded SEP numbers and executed/passed probe lists.
+
 ### Fixed — a resumed recovery run reports its real cause to the circuit breaker
 
 After a restart, a run resumed from `recovering` or `refund_pending` used to be
