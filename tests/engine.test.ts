@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseCorridor, hashCorridor, type Corridor } from "@corridor/manifest";
-import { createMockAdapter, type OpenTransaction } from "@corridor/adapter-kit";
-import { StaticRouteResolver } from "@corridor/router";
+import {
+  createMockAdapter,
+  createMockSourceAdapter,
+  type OpenTransaction,
+} from "@corridor/adapter-kit";
+import {
+  StaticRouteResolver,
+  UnattestedAnchorError,
+  type RouteResolver,
+} from "@corridor/router";
 import { amountRangeCheck } from "@corridor/sep31";
 import {
   defaultSep31Gate,
@@ -13,7 +21,6 @@ import {
   canTransition,
   createMockSubmitter,
   StellarPaymentStrategy,
-  StellarPathPaymentStrategy,
   execute,
   reconcileUntil,
   type CorridorState,
@@ -22,15 +29,24 @@ import {
   type SettlementSubmitter,
   type SettlementStrategy,
   type StoredRun,
-  type PathPaymentFinder,
 } from "@corridor/engine";
 import type { TransactionStatus } from "@corridor/adapter-kit";
 import { fail, ok, type Outcome, type PaymentIntent, settlementId } from "@corridor/types";
+import { StellarPathPaymentStrategy, StellarSettlementSubmitter } from "@corridor/stellar";
+import { Account, Keypair, type Horizon, type Transaction } from "@stellar/stellar-sdk";
 
-function corridor(): Corridor {
+function corridor(sourceProtocol: "prefunded" | "sep6" = "prefunded"): Corridor {
   const r = parseCorridor({
     id: "test",
-    source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
+    source: {
+      name: "S",
+      asset: "USDC",
+      protocol: sourceProtocol,
+      endpoints: {
+        home_domain: "s.example",
+        ...(sourceProtocol === "sep6" && { transfer_server: "https://s.example/sep6" }),
+      },
+    },
     dest: {
       name: "D",
       asset: "iso4217:ARS",
@@ -79,6 +95,28 @@ function deps(adapterOpts = {}, trustManifestWithoutAttestation = true): EngineD
 }
 
 describe("engine.execute", () => {
+  it("funds a non-prefunded corridor through its source adapter before settling", async () => {
+    const nonPrefunded = corridor("sep6");
+    const source = createMockSourceAdapter();
+    const receiving = createMockAdapter();
+    const r = await execute(intent("source-funded"), nonPrefunded, {
+      ...deps(),
+      resolver: {
+        async resolve() {
+          return { receiving, sending: source, trust: "manifest" as const };
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.state).toBe("completed");
+      expect(r.value.trail).toContain("funding");
+      expect(r.value.trail).toContain("funded");
+      expect(r.value.trail.indexOf("funding")).toBeLessThan(r.value.trail.indexOf("settling"));
+      expect(r.value.trail.indexOf("funded")).toBeLessThan(r.value.trail.indexOf("settling"));
+    }
+  });
+
   it("walks a payment to completed", async () => {
     const r = await execute(intent(), corridor(), deps());
     expect(r.ok).toBe(true);
@@ -252,95 +290,6 @@ describe("engine.execute", () => {
       expect(r.value.stellarTxHash).toBe("existing-tx-hash-123");
     }
     expect(submitCalls).toBe(0);
-  });
-});
-
-describe("engine settlement strategy selection", () => {
-  function corridorWithReceiveAsset(): Corridor {
-    const r = parseCorridor({
-      id: "test",
-      source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
-      dest: {
-        name: "D",
-        asset: "iso4217:ARS",
-        endpoints: {
-          home_domain: "d.example",
-          transfer_server_sep31: "https://d.example/sep31",
-          endpoints_verified_at: "1970-01-01",
-        },
-      },
-      fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
-      compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
-      settlement: {
-        network: "public",
-        asset_issuer: "GISSUER",
-        receive_asset: "ARS",
-        receive_asset_issuer: "GARSISSUER",
-        max_slippage_bps: 50,
-      },
-      recovery: { max_retries: 2 },
-      proof: {
-        canary_completed_at: "1970-01-01T00:00:00Z",
-        stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
-        anchor_transaction_id: "canary-test",
-        amount: "1",
-        max_age_days: 50000,
-      },
-    });
-    if (!r.ok) throw new Error("fixture invalid");
-    return r.value;
-  }
-
-  it("selects the path-payment strategy when receive_asset differs from bridge_asset", async () => {
-    const finder: PathPaymentFinder = {
-      async findStrictSendPath() {
-        return ok({
-          destinationAmount: "100.00",
-          path: [
-            {
-              asset_code: "MID",
-              asset_issuer: "GMIDISSUER",
-            },
-          ],
-        });
-      },
-    };
-    const submitter = createMockSubmitter();
-    const pathStrategy = new StellarPathPaymentStrategy(submitter, finder);
-    const paymentStrategy = new StellarPaymentStrategy(submitter);
-    const pathSpy = vi.spyOn(pathStrategy, "settle");
-    const paymentSpy = vi.spyOn(paymentStrategy, "settle");
-
-    const r = await execute(intent("path-select"), corridorWithReceiveAsset(), {
-      ...deps(),
-      strategies: [paymentStrategy, pathStrategy],
-    });
-
-    expect(r.ok).toBe(true);
-    expect(pathSpy).toHaveBeenCalledOnce();
-    expect(paymentSpy).not.toHaveBeenCalled();
-  });
-
-  it("keeps the plain payment strategy when receive_asset matches bridge_asset", async () => {
-    const finder: PathPaymentFinder = {
-      async findStrictSendPath() {
-        throw new Error("finder should not be consulted");
-      },
-    };
-    const submitter = createMockSubmitter();
-    const pathStrategy = new StellarPathPaymentStrategy(submitter, finder);
-    const paymentStrategy = new StellarPaymentStrategy(submitter);
-    const pathSpy = vi.spyOn(pathStrategy, "settle");
-    const paymentSpy = vi.spyOn(paymentStrategy, "settle");
-
-    const r = await execute(intent("path-select-same"), corridor(), {
-      ...deps(),
-      strategies: [paymentStrategy, pathStrategy],
-    });
-
-    expect(r.ok).toBe(true);
-    expect(paymentSpy).toHaveBeenCalledOnce();
-    expect(pathSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -658,6 +607,61 @@ function resumableRun(state: CorridorState, key = "resume-state"): StoredRun {
 }
 
 describe("engine crash resume states", () => {
+  it("resumes an opened non-prefunded run by funding before settlement", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "resume-opened-source";
+    await store.put(resumableRun("opened", key));
+    const source = createMockSourceAdapter();
+    const openDeposit = vi.spyOn(source, "openDeposit");
+    const receiving = createMockAdapter();
+    const r = await execute(intent(key), corridor("sep6"), {
+      ...deps(),
+      idempotency: store,
+      resolver: {
+        async resolve() {
+          return { receiving, sending: source, trust: "manifest" as const };
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.trail).toContain("funding");
+      expect(r.value.trail).toContain("funded");
+      expect(r.value.trail.indexOf("funded")).toBeLessThan(r.value.trail.indexOf("settling"));
+    }
+    expect(openDeposit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["funding", "funded"] as const)(
+    "resumes from %s without opening a second source deposit",
+    async (state) => {
+      const store = new InMemoryIdempotencyStore();
+      const key = "resume-funded";
+      const c = corridor();
+      const source = createMockSourceAdapter();
+      const deposit = await source.openDeposit(intent(key), c);
+      if (!deposit.ok) throw new Error("mock source deposit did not open");
+      await store.put({
+        ...resumableRun(state, key),
+        sourceTransactionId: deposit.value.transactionId,
+      });
+      const openDeposit = vi.spyOn(source, "openDeposit");
+      const receiving = createMockAdapter();
+      const r = await execute(intent(key), corridor(), {
+        ...deps(),
+        idempotency: store,
+        resolver: {
+          async resolve() {
+            return { receiving, sending: source, trust: "manifest" as const };
+          },
+        },
+      });
+      expect(r.ok).toBe(true);
+      expect(openDeposit).not.toHaveBeenCalled();
+      expect((await store.get(key))?.sourceTransactionId).toBe(deposit.value.transactionId);
+    },
+  );
+
   it.each(["created", "quoted", "compliant"] as const)(
     "%s is failed as stale before anything is sent",
     async (state) => {
@@ -885,6 +889,86 @@ describe("engine crash resume states", () => {
       expect(r.ok).toBe(true);
       expect((await store.get(key))?.state).toBe("completed");
     });
+  });
+});
+
+describe("engine route refusal (#257)", () => {
+  // The registry resolver fails closed by throwing; any resolver may.
+  const refusing: RouteResolver = {
+    async resolve() {
+      throw new UnattestedAnchorError("d.example", "no attestation on file");
+    },
+  };
+
+  it("fails a fresh run instead of stranding it in created, with an audit entry", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const audit = new InMemoryAuditLog();
+    const d = { ...deps(), idempotency: store, audit, resolver: refusing };
+
+    const r = await execute(intent("refused"), corridor(), d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("ROUTE_REFUSED");
+      expect(r.error.retryable).toBe(false);
+      expect(r.error.message).toContain("refusing to route through d.example");
+    }
+    const stored = await store.get("refused");
+    expect(stored?.state).toBe("failed");
+    expect(stored?.lastError).toMatch(/^ROUTE_REFUSED: /);
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]).toMatchObject({
+      idempotencyKey: "refused",
+      from: "created",
+      to: "failed",
+      error: expect.stringMatching(/^ROUTE_REFUSED: /),
+    });
+
+    // The key is spent, and says so, rather than reporting a run still in flight.
+    const again = await execute(intent("refused"), corridor(), d);
+    expect(again.ok).toBe(false);
+    if (!again.ok) {
+      expect(again.error.code).toBe("IDEMPOTENCY_CONFLICT");
+      expect(again.error.message).toContain("state=failed");
+    }
+  });
+
+  it("leaves a settled run untouched and resumable on resume", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const audit = new InMemoryAuditLog();
+    const key = "refused-resume-settled";
+    await store.put(resumableRun("settled", key));
+    const before = await store.get(key);
+
+    const r = await execute(intent(key), corridor(), {
+      ...deps(),
+      idempotency: store,
+      audit,
+      resolver: refusing,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("ROUTE_REFUSED");
+    expect(await store.get(key)).toEqual(before);
+    expect(audit.entries).toHaveLength(0);
+
+    // Once a route is available again, the same key reconciles to completion.
+    const resumed = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+    expect(resumed.ok).toBe(true);
+    expect((await store.get(key))?.state).toBe("completed");
+  });
+
+  it("fails a run resumed from created, which moved no money", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "refused-resume-created";
+    await store.put({ ...resumableRun("created", key), transactionId: undefined });
+
+    const r = await execute(intent(key), corridor(), {
+      ...deps(),
+      idempotency: store,
+      resolver: refusing,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("ROUTE_REFUSED");
+    expect((await store.get(key))?.state).toBe("failed");
   });
 });
 
@@ -2586,6 +2670,117 @@ describe("SettlementStrategy", () => {
       expect(settlingIdx).toBeGreaterThan(-1);
       expect(settledIdx).toBe(settlingIdx + 1);
     }
+  });
+});
+
+describe("path-payment settlement selection (#217)", () => {
+  const BRIDGE_ISSUER = Keypair.random().publicKey();
+  const RECV_ISSUER = Keypair.random().publicKey();
+  const DEPOSIT = Keypair.random().publicKey();
+
+  function pathCorridor(): Corridor {
+    const base = corridor();
+    const r = parseCorridor({
+      ...base,
+      settlement: {
+        ...base.settlement,
+        asset_issuer: BRIDGE_ISSUER,
+        receive_asset: "ARSX",
+        receive_asset_issuer: RECV_ISSUER,
+      },
+    });
+    if (!r.ok) throw new Error("fixture invalid");
+    return r.value;
+  }
+
+  /** A real StellarPathPaymentStrategy over a fake Horizon with one 99.9 ARSX path. */
+  function pathStrategy() {
+    const submitted: Transaction[] = [];
+    const strictSendPaths = vi.fn(() => ({
+      call: async () => ({ records: [{ destination_amount: "99.9000000", path: [] }] }),
+    }));
+    const server = {
+      loadAccount: async (id: string) => new Account(id, "100"),
+      submitTransaction: async (tx: Transaction) => {
+        submitted.push(tx);
+        return { successful: true };
+      },
+      strictSendPaths,
+      transactions: () => ({
+        transaction: () => ({ call: async () => ({ successful: true, ledger_attr: 7 }) }),
+      }),
+    } as unknown as Horizon.Server;
+    const strategy = new StellarPathPaymentStrategy(
+      new StellarSettlementSubmitter({
+        signerSecret: Keypair.random().secret(),
+        horizonUrl: "unused",
+        horizonServer: server,
+        allowedNetworks: ["public"],
+        allowLocalSignerOnMainnet: true,
+      }),
+    );
+    return { strategy, strictSendPaths, submitted };
+  }
+
+  function pathDeps() {
+    const submitter = createMockSubmitter();
+    const submit = vi.spyOn(submitter, "submit");
+    const d: EngineDeps = {
+      ...deps({ instructions: { kind: "stellar_payment", to: DEPOSIT, memo: "m-1" } }),
+      submitter,
+    };
+    return { d, submitter, submit };
+  }
+
+  it("selects StellarPathPaymentStrategy when receive_asset differs from bridge_asset", async () => {
+    const path = pathStrategy();
+    const { d, submitter, submit } = pathDeps();
+    const r = await execute(intent("path-select"), pathCorridor(), {
+      ...d,
+      // Plain strategy listed first: it must decline, not pay the bridge asset.
+      strategies: [new StellarPaymentStrategy(submitter), path.strategy],
+    });
+
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.state).toBe("completed");
+    expect(submit).not.toHaveBeenCalled();
+    expect(path.strictSendPaths).toHaveBeenCalledOnce();
+    expect(path.submitted).toHaveLength(1);
+    const op = path.submitted[0]!.operations[0]!;
+    expect(op.type).toBe("pathPaymentStrictSend");
+    if (op.type === "pathPaymentStrictSend") {
+      expect(op.destination).toBe(DEPOSIT);
+      expect(op.sendAmount).toBe("100.0000000");
+      expect(op.destAsset.getCode()).toBe("ARSX");
+      // 99.9 × (1 - 50 bps) = 99.4005
+      expect(op.destMin).toBe("99.4005000");
+    }
+  });
+
+  it("keeps the plain payment strategy when the corridor has no differing receive_asset", async () => {
+    const path = pathStrategy();
+    const { d, submitter, submit } = pathDeps();
+    const r = await execute(intent("path-select-same"), corridor(), {
+      ...d,
+      strategies: [path.strategy, new StellarPaymentStrategy(submitter)],
+    });
+
+    expect(r.ok).toBe(true);
+    expect(submit).toHaveBeenCalledOnce();
+    expect(path.strictSendPaths).not.toHaveBeenCalled();
+    expect(path.submitted).toHaveLength(0);
+  });
+
+  it("fails closed without paying the bridge asset when no path strategy is wired", async () => {
+    const { d, submit } = pathDeps();
+    const r = await execute(intent("path-missing"), pathCorridor(), d);
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      expect(r.error.message).toMatch(/ARSX/);
+    }
+    expect(submit).not.toHaveBeenCalled();
   });
 });
 

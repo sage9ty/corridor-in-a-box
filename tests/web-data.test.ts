@@ -21,6 +21,6 @@ describe("web/ generated data", () => {
       states: string[];
     };
     expect(states).toEqual([...ALL_STATES]);
-    expect(states).toHaveLength(15);
+    expect(states).toHaveLength(17);
   });
 });

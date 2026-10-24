@@ -226,21 +226,22 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         state: params[2],
         version: params[3] as number,
         transaction_id: params[4],
-        quote_id: params[5],
-        quote_expires_at: params[6],
-        quote_firm: params[7],
-        settlement_amount: params[8],
-        stellar_tx_hash: params[9],
-        settlement_kind: params[10],
-        settlement_ref: params[11],
-        deposit_address: params[12],
-        memo: params[13],
-        memo_type: params[14],
-        refund_id: params[15],
-        last_error: params[16],
-        owner: params[17],
-        settlement: params[18],
-        manifest_hash: params[19],
+        source_transaction_id: params[5],
+        quote_id: params[6],
+        quote_expires_at: params[7],
+        quote_firm: params[8],
+        settlement_amount: params[9],
+        stellar_tx_hash: params[10],
+        settlement_kind: params[11],
+        settlement_ref: params[12],
+        deposit_address: params[13],
+        memo: params[14],
+        memo_type: params[15],
+        refund_id: params[16],
+        last_error: params[17],
+        owner: params[18],
+        settlement: params[19],
+        manifest_hash: params[20],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -298,6 +299,43 @@ describe("state round-trips", () => {
     const got = await store.get("k-rp");
     expect(got?.state).toBe("refund_pending");
     expect(got?.stellarTxHash).toBe("hash_rp");
+  });
+
+  it("PostgresIdempotencyStore persists the source deposit reference", async () => {
+    const store = new PostgresIdempotencyStore(fakeDb());
+    await store.put({
+      idempotencyKey: "k-source",
+      corridorId: "c",
+      state: "funding",
+      version: 2,
+      sourceTransactionId: "source-deposit-1",
+    });
+    expect((await store.get("k-source"))?.sourceTransactionId).toBe("source-deposit-1");
+  });
+
+  it("in-memory store never erases or replaces a source deposit reference", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funding",
+      version: 2,
+      sourceTransactionId: "source-deposit-1",
+    });
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funded",
+      version: 3,
+    });
+    await store.put({
+      idempotencyKey: "k-source-keep",
+      corridorId: "c",
+      state: "funded",
+      version: 4,
+      sourceTransactionId: "source-deposit-2",
+    });
+    expect((await store.get("k-source-keep"))?.sourceTransactionId).toBe("source-deposit-1");
   });
 });
 
@@ -407,6 +445,7 @@ describe("refund state round-trips", () => {
       "settlement_amount",
       "deposit_address",
       "manifest_hash",
+      "source_transaction_id",
       "settlement_kind",
       "settlement_ref",
     ]) {

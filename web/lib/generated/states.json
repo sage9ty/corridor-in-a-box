@@ -4,6 +4,8 @@
     "quoted",
     "compliant",
     "opened",
+    "funding",
+    "funded",
     "verifying",
     "settling",
     "retrying",
@@ -38,12 +40,24 @@
       "failed"
     ],
     "opened": [
+      "funding",
+      "verifying",
+      "recovering",
+      "failed"
+    ],
+    "funding": [
+      "funded",
+      "recovering",
+      "failed"
+    ],
+    "funded": [
       "verifying",
       "recovering",
       "failed"
     ],
     "verifying": [
       "settling",
+      "recovering",
       "failed"
     ],
     "settling": [

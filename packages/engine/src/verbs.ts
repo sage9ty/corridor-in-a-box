@@ -21,11 +21,12 @@ import {
   type Quote,
   type TransactionStatus,
 } from "@corridor/adapter-kit";
-import type {
-  DepositInstructionsKind,
-  SettlementRef,
-  SettlementRequest,
-  SettlementStrategy,
+import {
+  needsPathPayment,
+  type DepositInstructionsKind,
+  type SettlementRef,
+  type SettlementRequest,
+  type SettlementStrategy,
 } from "./ports";
 import type { Logger, Metrics } from "./observability";
 
@@ -141,15 +142,22 @@ export async function settle(
     opened.instructions?.kind ??
     (opened as { kind?: DepositInstructionsKind }).kind ??
     "stellar_payment";
-  const strategy = strategies.find((s) => s.kind === kind);
+  const ctx = { opened, quote: q, corridor, adapter };
+  const strategy = strategies.find((s) => s.kind === kind && (s.matches?.(ctx) ?? true));
   if (!strategy) {
+    const { bridge_asset, receive_asset } = corridor.settlement;
     return fail(
       "SETTLEMENT_FAILED",
-      `no settlement strategy registered for kind "${kind}" — add a SettlementStrategy with kind="${kind}" to EngineDeps.strategies`,
+      strategies.some((s) => s.kind === kind)
+        ? `every "${kind}" settlement strategy declined this corridor` +
+            (needsPathPayment(corridor)
+              ? ` (anchor receives ${receive_asset}, not bridge asset ${bridge_asset}) — add a path-payment strategy such as StellarPathPaymentStrategy to EngineDeps.strategies`
+              : "")
+        : `no settlement strategy registered for kind "${kind}" — add a SettlementStrategy with kind="${kind}" to EngineDeps.strategies`,
       { retryable: false },
     );
   }
-  return strategy.settle({ opened, quote: q, corridor, adapter });
+  return strategy.settle(ctx);
 }
 
 // 4. RECONCILE — match the on-chain leg against the anchor's view of the payout.
@@ -220,7 +228,7 @@ export interface PollOptions {
 //     `RECONCILE_STALLED` — the anchor is stuck, not slow. This lets the engine
 //     recover (refund/hold) long before the corridor deadline expires.
 export async function reconcileUntil(
-  adapter: AnchorAdapter,
+  adapter: Pick<AnchorAdapter, "getTransaction">,
   transactionId: string,
   opts: PollOptions,
 ): Promise<Outcome<TransactionStatus>> {

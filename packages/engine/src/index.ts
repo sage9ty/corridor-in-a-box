@@ -51,6 +51,7 @@ export {
   StellarPaymentStrategy,
   AdapterSettledStrategy,
   defaultStrategies,
+  needsPathPayment,
   settlementId,
   type SettlementSubmitter,
   type ChainVerifier,

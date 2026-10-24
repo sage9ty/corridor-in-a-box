@@ -775,6 +775,19 @@ describe("ensureCompliance", () => {
     }
   });
 
+  it("reads anchorCustomerId through the shared SEP-12 check, ahead of sep12Id", async () => {
+    const { fn, calls } = fakeFetch({
+      "GET /sep12/customer": res({ id: "cust-2", status: "ACCEPTED" }),
+    });
+    const c = corridor({ kyc_server: "https://d.example/sep12" });
+    const r = await new Sep6Adapter(c, { fetchImpl: fn }).ensureCompliance(
+      { ...intent, recipient: { id: "r", sep12Id: "cust-1", anchorCustomerId: "cust-2" } },
+      c,
+    );
+    expect(r.ok && r.value.status).toBe("accepted");
+    expect(params(calls[0]).get("id")).toBe("cust-2");
+  });
+
   it("treats an anchor outage as retryable and a 4xx as final", async () => {
     const c = corridor({ kyc_server: "https://d.example/sep12" });
     const { fn } = fakeFetch({ "GET /sep12/customer": res({}, false, 502) });
