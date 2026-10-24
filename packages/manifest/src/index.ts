@@ -27,7 +27,7 @@ export const AnchorEndpointsSchema = z.object({
   home_domain: z.string().min(1),
   /** SEP-31 DIRECT_PAYMENT_SERVER */
   transfer_server_sep31: z.string().url().optional(),
-  /** SEP-10 WEB AUTH ENDPOINT */
+  /** SEP-10 WEB_AUTH_ENDPOINT */
   web_auth: z.string().url().optional(),
   /** SEP-12 KYC_SERVER */
   kyc_server: z.string().url().optional(),
@@ -180,10 +180,35 @@ export const FxSchema = z
     }
   });
 
+/**
+ * How a corridor's receiving-side KYC is performed. The same vocabulary as
+ * `AdapterCapabilities.kyc`, so a manifest and an adapter cannot drift apart.
+ *  - `sep12`:       the receiver is registered via SEP-12 and its status read
+ *                   with `GET /customer` against the dest's `kyc_server`.
+ *  - `sep6_fields`: KYC travels inline on the SEP-6 request. The engine carries
+ *                   field NAMES and operator-supplied references, never raw PII.
+ *  - `bespoke`:     anchor-specific onboarding; the engine only carries the
+ *                   anchor's customer reference (`PartyRef.anchorCustomerId`).
+ *  - `none`:        no per-customer KYC at the receiver.
+ */
+export const COMPLIANCE_METHODS = ["sep12", "sep6_fields", "bespoke", "none"] as const;
+export type ComplianceMethod = (typeof COMPLIANCE_METHODS)[number];
+
 export const ComplianceSchema = z.object({
   source_jurisdiction: z.string().min(1),
   dest_jurisdiction: z.string().min(1),
   travel_rule_profile: z.string().default("default"),
+  /**
+   * How the receiver's KYC is done (#193). Optional, and deliberately NOT
+   * filled in at parse time: a parse-time default would change `hashCorridor`
+   * for every existing manifest and refuse to resume their in-flight runs.
+   * Read it through `complianceMethod()`, which derives the default — `sep12`
+   * when the dest has a `kyc_server`, else `none`.
+   *
+   * An explicit value is a claim the engine checks against the adapter's
+   * `capabilities().kyc` before any money moves; a mismatch fails closed.
+   */
+  method: z.enum(COMPLIANCE_METHODS).optional(),
   /**
    * SEP-12 customer `type` for the receiving party.
    *
@@ -199,41 +224,47 @@ export const ComplianceSchema = z.object({
   sep12_sender_type: z.string().default("sep31-sender"),
 });
 
-export const SettlementSchema = z.object({
-  /** The on-chain bridge asset moved between the two anchors. */
-  bridge_asset: z.string().default("USDC"),
-  network: z.enum(["public", "testnet"]),
-  /** Issuer account of the bridge asset on the chosen network. */
-  asset_issuer: z.string().min(1),
-  /**
-   * Asset code the destination anchor actually receives. When set and
-   * different from `bridge_asset`, the settle leg must route through the
-   * Dex via `pathPaymentStrictSend` instead of a plain payment. Omit to
-   * settle in `bridge_asset` directly.
-   */
-  receive_asset: z.string().min(1).optional(),
-  /** Issuer account of `receive_asset`. Required whenever `receive_asset` is set. */
-  receive_asset_issuer: z.string().min(1).optional(),
-  /**
-   * Maximum slippage, in basis points, tolerated on a path payment. `destMin` is
-   * set to `expected × (1 - max_slippage_bps / 10000)`. Defaults to a
-   * conservative 50 bps (0.5%).
-   */
-  max_slippage_bps: z.number().int().nonnegative().max(10_000).default(50),
-})
-  .superRefine((settlement, ctx) => {
-    if (settlement.receive_asset !== undefined && settlement.receive_asset_issuer === undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["receive_asset_issuer"],
-        message: "receive_asset_issuer is required when receive_asset is set",
-      });
-    }
-    if (settlement.receive_asset === undefined && settlement.receive_asset_issuer !== undefined) {
+export const SettlementSchema = z
+  .object({
+    /** The on-chain bridge asset moved between the two anchors. */
+    bridge_asset: z.string().default("USDC"),
+    network: z.enum(["public", "testnet"]),
+    /** Issuer account of the bridge asset on the chosen network. */
+    asset_issuer: z.string().min(1),
+    /**
+     * Asset code the receiving anchor accepts on-chain, when it is not the bridge
+     * asset. Set it and the settle leg becomes a `path_payment_strict_send`
+     * through the DEX: `bridge_asset` goes out, `receive_asset` arrives. Omit to
+     * pay `bridge_asset` directly.
+     */
+    receive_asset: z.string().min(1).optional(),
+    /** Issuer account of `receive_asset`. Required unless `receive_asset` is XLM. */
+    receive_asset_issuer: z.string().min(1).optional(),
+    /**
+     * Worst price move tolerated on a path payment, in basis points: the payment
+     * fails on-chain rather than deliver less than `expected × (1 - bps/10000)`.
+     * Omit for the conservative default of 50 (0.5%). Optional rather than
+     * defaulted so manifests that never path-pay keep their existing hash.
+     */
+    max_slippage_bps: z.number().int().min(0).lt(10_000).optional(),
+  })
+  .superRefine((s, ctx) => {
+    if (s.receive_asset_issuer !== undefined && s.receive_asset === undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["receive_asset"],
-        message: "receive_asset is required when receive_asset_issuer is set",
+        message: "receive_asset_issuer is set but receive_asset is not",
+      });
+    }
+    if (
+      s.receive_asset !== undefined &&
+      s.receive_asset.toUpperCase() !== "XLM" &&
+      s.receive_asset_issuer === undefined
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["receive_asset_issuer"],
+        message: `receive_asset_issuer is required for receive_asset "${s.receive_asset}"`,
       });
     }
   });
@@ -311,65 +342,154 @@ export const RecoverySchema = z.object({
 
 /** True when the YYYY-MM-DD part names a real calendar day. `Date` alone is no help:
  *  it rolls 2026-02-30 over to 2 March instead of rejecting it. */
-function isRealCalendarDay(date: string): boolean {
-  const [y, m, d] = date.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
+function isRealCalendarDate(value: string): boolean {
+  const [y, m, d] = value.slice(0, 10).split("-").map(Number) as [number, number, number];
+  const probe = new Date(Date.UTC(y, m - 1, d));
   return (
-    dt.getUTCFullYear() === y &&
-    dt.getUTCMonth() === m - 1 &&
-    dt.getUTCDate() === d
+    probe.getUTCFullYear() === y && probe.getUTCMonth() === m - 1 && probe.getUTCDate() === d
   );
 }
 
-export const CorridorManifestSchema = z.object({
-  id: z.string().min(1),
-  source: SourceAnchorSchema,
-  dest: DestSchema,
-  fx: FxSchema,
-  compliance: ComplianceSchema,
-  settlement: SettlementSchema,
-  limits: LimitsSchema.optional(),
-  recovery: RecoverySchema.default(() => RecoverySchema.parse({})),
+/** Canary payment evidence proving this exact lane successfully moved money. */
+export const ProofSchema = z.object({
+  /** ISO date or timestamp on which the canary payment reached completed. */
+  canary_completed_at: z
+    .string()
+    .regex(
+      /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?)?$/,
+      "expected an ISO date (YYYY-MM-DD) or timestamp",
+    )
+    .refine(isRealCalendarDate, "not a real calendar date"),
+  /** 64-hex Stellar transaction hash for the on-chain settlement leg. */
+  stellar_tx_hash: z
+    .string()
+    .regex(/^[0-9a-fA-F]{64}$/, "expected a 64-character hex transaction hash"),
+  /** Destination anchor's external transaction / order ID. */
+  anchor_transaction_id: z.string().min(1),
+  /** Amount delivered or transferred in the canary payment, as a decimal string. */
+  amount: z.string().regex(/^\d+(\.\d+)?$/, "expected a positive decimal amount"),
+  /** Max validity age of the proof in days before becoming stale. Default 30. */
+  max_age_days: z.number().int().positive().default(30),
+  /** Optional canary max amount ceiling. */
+  canary_max_amount: z
+    .string()
+    .regex(/^\d+(\.\d+)?$/, "expected a positive decimal amount")
+    .optional(),
 });
 
-export type CorridorManifest = z.infer<typeof CorridorManifestSchema>;
+export const CorridorSchema = z
+  .object({
+    id: z.string().min(1),
+    /** Human note. Use it to record liveness, e.g. "pending: no RMB SEP-31 anchor". */
+    status_note: z.string().optional(),
+    source: SourceAnchorSchema,
+    dest: DestSchema,
+    fx: FxSchema,
+    compliance: ComplianceSchema,
+    settlement: SettlementSchema,
+    recovery: RecoverySchema,
+    limits: LimitsSchema.optional(),
+    proof: ProofSchema.optional(),
+  })
+  .superRefine((c, ctx) => {
+    // `compliance.method` needs dest context ComplianceSchema cannot see. Refuse
+    // the combinations that could never run rather than let them fail later.
+    const method = c.compliance.method;
+    if (method === "sep12" && !hasKycServer(c.dest)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: 'compliance.method "sep12" requires dest.endpoints.kyc_server',
+      });
+    }
+    if (method === "sep6_fields" && c.dest.protocol !== "sep6") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["compliance", "method"],
+        message: `compliance.method "sep6_fields" requires dest.protocol "sep6", got "${c.dest.protocol}"`,
+      });
+    }
+  });
 
-export function parseManifest(raw: unknown): Result<CorridorManifest> {
-  const result = CorridorManifestSchema.safeParse(raw);
-  if (!result.success) {
-    return fail({
-      code: "MANIFEST_INVALID",
-      message: result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
-    });
-  }
-  return ok(result.data);
+function hasKycServer(dest: z.infer<typeof DestSchema>): boolean {
+  return "kyc_server" in dest.endpoints && Boolean(dest.endpoints.kyc_server);
 }
 
-export function loadManifest(path: string): Result<CorridorManifest> {
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (e) {
-    return fail({
-      code: "MANIFEST_READ",
-      message: `${path}: ${(e as Error).message}`,
-    });
+/**
+ * The corridor's compliance method: the explicit `compliance.method` when set,
+ * otherwise `sep12` when the dest exposes a `kyc_server` and `none` when it
+ * does not — the same answer `Sep31Adapter.capabilities().kyc` gives.
+ *
+ * The adapter stays authoritative for what it actually enforces: a derived
+ * `none` never switches off a check an adapter performs (the SEP-6 adapter,
+ * for one, still refuses a dest with no `kyc_server`).
+ */
+export function complianceMethod(corridor: Corridor): ComplianceMethod {
+  return corridor.compliance.method ?? (hasKycServer(corridor.dest) ? "sep12" : "none");
+}
+
+export type Corridor = z.infer<typeof CorridorSchema>;
+export type DestProtocol = "sep31" | "sep6" | `custom:${string}`;
+export type Sep31Anchor = z.infer<typeof Sep31DestSchema>;
+export type Sep6Anchor = z.infer<typeof Sep6DestSchema>;
+export type CustomAnchor = z.infer<typeof CustomDestSchema>;
+export type AnchorConfig = Sep31Anchor | Sep6Anchor | CustomAnchor;
+
+export function protocolOf(anchor: z.infer<typeof DestSchema>): DestProtocol {
+  return anchor.protocol as DestProtocol;
+}
+export type SourceAnchorConfig = z.infer<typeof SourceAnchorSchema>;
+export type Proof = z.infer<typeof ProofSchema>;
+
+/** Successful parse, plus non-fatal warnings (e.g. deprecated legacy shapes).
+ *  Assignable to `Outcome<Corridor>`, so existing callers are unaffected. */
+export type ParseCorridorOutcome =
+  (Ok<Corridor> & { readonly warnings: string[] }) | Err<CorridorError>;
+
+/** Parse + validate a corridor manifest from an object already in memory. */
+export function parseCorridor(raw: unknown): ParseCorridorOutcome {
+  const warnings: string[] = [];
+  const dest =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>).dest : undefined;
+  if (dest && typeof dest === "object" && !Array.isArray(dest) && !("protocol" in dest)) {
+    // Legacy flat SEP-31 manifest: no `protocol`. Parsed as sep31 for backward
+    // compatibility, but a key belonging to another protocol is ambiguous.
+    const ep = (dest as Record<string, unknown>).endpoints;
+    const keys = ep && typeof ep === "object" ? ep : {};
+    if ("transfer_server" in keys) {
+      return fail(
+        "MANIFEST_INVALID",
+        "dest.protocol: manifest dest specifies transfer_server with no protocol; set protocol: sep6",
+      );
+    }
+    if ("base_url" in keys) {
+      return fail(
+        "MANIFEST_INVALID",
+        "dest.protocol: manifest dest specifies base_url with no protocol; set protocol: custom:<name>",
+      );
+    }
+    warnings.push(
+      "dest anchor specifies no protocol; defaulting to 'sep31'. " +
+        "Set dest.protocol: 'sep31' explicitly; omitting it is deprecated.",
+    );
   }
+  const parsed = CorridorSchema.safeParse(raw);
+  if (!parsed.success) {
+    return fail("MANIFEST_INVALID", formatZodError(parsed.error), { cause: parsed.error });
+  }
+  return { ...ok(parsed.data), warnings };
+}
+
+/** Read + validate a *.corridor.yaml file from disk. */
+export function loadCorridor(path: string): ParseCorridorOutcome {
   let raw: unknown;
   try {
-    raw = parseYaml(text);
-  } catch (e) {
-    return fail({
-      code: "MANIFEST_PARSE",
-      message: `${path}: $(e as Error).message`,
-    });
+    raw = parseYaml(readFileSync(path, "utf8"));
+  } catch (cause) {
+    return fail("MANIFEST_INVALID", `cannot read or parse ${path}`, { cause });
   }
-  return parseManifest(raw);
+  return parseCorridor(raw);
 }
-
-export type Result<T> = Ok<T> | Err<CorridorError>;
-
-export { isRealCalendarDay };
 
 /** Parse + validate a corridor manifest from raw YAML text. */
 export function parseCorridorYaml(text: string): ParseCorridorOutcome {

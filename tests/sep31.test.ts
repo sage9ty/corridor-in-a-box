@@ -721,6 +721,82 @@ describe("SEP-12 compliance", () => {
   });
 });
 
+describe("customer reference: anchorCustomerId and the deprecated sep12Id (#193)", () => {
+  const c = corridor({
+    transfer_server_sep31: "https://d.example/sep31",
+    kyc_server: "https://d.example/sep12",
+  });
+  const withRecipient = (recipient: PaymentIntent["recipient"]): PaymentIntent => ({
+    ...intent,
+    recipient,
+  });
+  const lookedUp = async (recipient: PaymentIntent["recipient"]) => {
+    const { fn, calls } = fakeFetch({
+      "GET /sep12/customer": res({ id: "c1", status: "ACCEPTED" }),
+    });
+    const r = await new Sep31Adapter(c, { fetchImpl: fn }).ensureCompliance(
+      withRecipient(recipient),
+      c,
+    );
+    expect(r.ok && r.value.status).toBe("accepted");
+    return new URL(calls[0]!.url).searchParams.get("id");
+  };
+
+  it("honours the deprecated sep12Id on its own", async () => {
+    expect(await lookedUp({ id: "r", sep12Id: "legacy-1" })).toBe("legacy-1");
+  });
+
+  it("honours anchorCustomerId on its own", async () => {
+    expect(await lookedUp({ id: "r", anchorCustomerId: "neutral-1" })).toBe("neutral-1");
+  });
+
+  it("prefers anchorCustomerId when both are set", async () => {
+    expect(
+      await lookedUp({ id: "r", sep12Id: "legacy-1", anchorCustomerId: "neutral-1" }),
+    ).toBe("neutral-1");
+  });
+
+  it("still fails closed with neither, without touching the network", async () => {
+    const { fn, calls } = fakeFetch({});
+    const r = await new Sep31Adapter(c, { fetchImpl: fn }).ensureCompliance(
+      withRecipient({ id: "r" }),
+      c,
+    );
+    expect(!r.ok && r.error.code).toBe("KYC_REQUIRED");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("sends the preferred id as receiver_id / sender_id on open", async () => {
+    const { fn, calls } = fakeFetch({
+      "POST /sep31/transactions": res({
+        id: "tx-1",
+        stellar_account_id: "GDEPOSIT",
+        stellar_memo: "m",
+        stellar_memo_type: "text",
+      }),
+    });
+    const quote = {
+      id: "q1",
+      price: "1000",
+      expiresAt: Date.now() + 60_000,
+      sourceAmount: { asset: "USDC", amount: "100" },
+      destAmount: { asset: "iso4217:ARS", amount: "100000" },
+      firm: true,
+    };
+    await new Sep31Adapter(c, { fetchImpl: fn }).openTransaction(
+      {
+        ...intent,
+        sender: { id: "s", sep12Id: "legacy-sender" },
+        recipient: { id: "r", sep12Id: "legacy-1", anchorCustomerId: "neutral-1" },
+      },
+      quote,
+      c,
+    );
+    const tx = calls.find((call) => call.url.includes("/sep31/transactions"));
+    expect(tx?.body).toMatchObject({ receiver_id: "neutral-1", sender_id: "legacy-sender" });
+  });
+});
+
 describe("refund initiation (deliberately unsupported)", () => {
   // SEP-31 has no sender-initiated refund endpoint: a refund is initiated by
   // the RECEIVING anchor and only reported back on the transaction record.

@@ -7,12 +7,14 @@
 // component is included or injected here.
 
 import type { Corridor } from "@corridor/manifest";
-import type { AnchorAdapter } from "@corridor/adapter-kit";
+import type { AnchorAdapter, SourceAnchorAdapter } from "@corridor/adapter-kit";
 import type { PaymentIntent } from "@corridor/types";
 
 export interface RouteDecision {
   /** The receiving anchor chosen for this payment. */
   readonly receiving: AnchorAdapter;
+  /** Sending anchor used to on-ramp funds for non-prefunded corridors. */
+  readonly sending?: SourceAnchorAdapter;
   /**
    * Reserved for split routing across multiple anchors (weights sum to 1).
    * The engine ignores this field today and reads only `receiving`, so setting
@@ -38,6 +40,7 @@ export interface RouteResolver {
 
 export interface StaticRouteResolverOptions {
   readonly trustManifestWithoutAttestation?: boolean;
+  readonly sourceAdapterFor?: (corridor: Corridor) => SourceAnchorAdapter;
 }
 
 /**
@@ -48,7 +51,7 @@ export interface StaticRouteResolverOptions {
 export class StaticRouteResolver implements RouteResolver {
   constructor(
     private readonly adapterFor: (corridor: Corridor) => AnchorAdapter,
-    options?: StaticRouteResolverOptions,
+    private readonly options?: StaticRouteResolverOptions,
   ) {
     if (!options?.trustManifestWithoutAttestation) {
       throw new Error(
@@ -58,8 +61,10 @@ export class StaticRouteResolver implements RouteResolver {
   }
 
   async resolve(_intent: PaymentIntent, corridor: Corridor): Promise<RouteDecision> {
+    const sending = this.options?.sourceAdapterFor?.(corridor);
     return {
       receiving: this.adapterFor(corridor),
+      ...(sending ? { sending } : {}),
       trust: "manifest",
     };
   }

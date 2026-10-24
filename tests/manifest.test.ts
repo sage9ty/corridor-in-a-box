@@ -7,6 +7,7 @@ import {
   hashCorridor,
   manifestHash,
   canonicalJson,
+  complianceMethod,
 } from "@corridor/manifest";
 
 const valid = {
@@ -167,52 +168,59 @@ describe("manifest", () => {
     });
   });
 
-  describe("settlement", () => {
-    it("defaults max_slippage_bps and leaves receive_asset unset", () => {
+  describe("settlement receive_asset / max_slippage_bps (#217)", () => {
+    const withSettlement = (extra: Record<string, unknown>) =>
+      parseCorridor({ ...valid, settlement: { ...valid.settlement, ...extra } });
+
+    it("leaves all three unset (and the manifest hash unchanged) when omitted", () => {
       const r = parseCorridor(valid);
       expect(r.ok).toBe(true);
-      if (r.ok) {
-        expect(r.value.settlement.max_slippage_bps).toBe(50);
-        expect(r.value.settlement.receive_asset).toBeUndefined();
-        expect(r.value.settlement.receive_asset_issuer).toBeUndefined();
-      }
+      if (!r.ok) return;
+      expect(r.value.settlement.receive_asset).toBeUndefined();
+      expect(r.value.settlement.receive_asset_issuer).toBeUndefined();
+      expect(r.value.settlement.max_slippage_bps).toBeUndefined();
+      expect(canonicalJson(r.value.settlement)).toBe(
+        '{"asset_issuer":"GISSUER","bridge_asset":"USDC","network":"public"}',
+      );
     });
 
-    it("accepts receive_asset and receive_asset_issuer", () => {
-      const r = parseCorridor({
-        ...valid,
-        settlement: {
-          network: "public",
-          asset_issuer: "GISSUER",
-          receive_asset: "ARS",
-          receive_asset_issuer: "GARSISSUER",
-          max_slippage_bps: 25,
-        },
+    it("accepts a receive asset with its issuer and a slippage bound", () => {
+      const r = withSettlement({
+        receive_asset: "ARSX",
+        receive_asset_issuer: "GARSX",
+        max_slippage_bps: 25,
       });
       expect(r.ok).toBe(true);
-      if (r.ok) {
-        expect(r.value.settlement.receive_asset).toBe("ARS");
-        expect(r.value.settlement.receive_asset_issuer).toBe("GARSISSUER");
-        expect(r.value.settlement.max_slippage_bps).toBe(25);
+      if (!r.ok) return;
+      expect(r.value.settlement.receive_asset).toBe("ARSX");
+      expect(r.value.settlement.receive_asset_issuer).toBe("GARSX");
+      expect(r.value.settlement.max_slippage_bps).toBe(25);
+    });
+
+    it("accepts XLM as receive_asset without an issuer", () => {
+      expect(withSettlement({ receive_asset: "XLM" }).ok).toBe(true);
+    });
+
+    it("rejects receive_asset without receive_asset_issuer, and the reverse", () => {
+      const noIssuer = withSettlement({ receive_asset: "ARSX" });
+      expect(noIssuer.ok).toBe(false);
+      if (!noIssuer.ok) {
+        expect(noIssuer.error.code).toBe("MANIFEST_INVALID");
+        expect(noIssuer.error.message).toMatch(/receive_asset_issuer/);
       }
+      const noAsset = withSettlement({ receive_asset_issuer: "GARSX" });
+      expect(noAsset.ok).toBe(false);
+      if (!noAsset.ok) expect(noAsset.error.message).toMatch(/receive_asset/);
     });
 
-    it("rejects receive_asset without receive_asset_issuer", () => {
-      const r = parseCorridor({
-        ...valid,
-        settlement: { network: "public", asset_issuer: "GISSUER", receive_asset: "ARS" },
-      });
-      expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.error.code).toBe("MANIFEST_INVALID");
-    });
-
-    it("rejects an out-of-range max_slippage_bps", () => {
-      const r = parseCorridor({
-        ...valid,
-        settlement: { network: "public", asset_issuer: "GISSUER", max_slippage_bps: 10_001 },
-      });
-      expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.error.code).toBe("MANIFEST_INVALID");
+    it("rejects a max_slippage_bps that is negative, fractional, or 100% or more", () => {
+      for (const bad of [-1, 12.5, 10_000, 20_000]) {
+        const r = withSettlement({ max_slippage_bps: bad });
+        expect(r.ok, `max_slippage_bps ${bad}`).toBe(false);
+        if (!r.ok) expect(r.error.code).toBe("MANIFEST_INVALID");
+      }
+      expect(withSettlement({ max_slippage_bps: 0 }).ok).toBe(true);
+      expect(withSettlement({ max_slippage_bps: 9_999 }).ok).toBe(true);
     });
   });
 
@@ -488,6 +496,66 @@ describe("manifest", () => {
         expect(live.warnings.some((w) => w.includes("fx.quote_source=sep38"))).toBe(true);
       }
     });
+  });
+});
+
+describe("compliance.method (#193)", () => {
+  const withDest = (
+    endpoints: Record<string, string>,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    ...valid,
+    dest: { ...valid.dest, endpoints: { ...valid.dest.endpoints, ...endpoints } },
+    ...extra,
+  });
+
+  it("defaults to sep12 when the dest has a kyc_server", () => {
+    const r = parseCorridor(withDest({ kyc_server: "https://d.example/sep12" }));
+    expect(r.ok && complianceMethod(r.value)).toBe("sep12");
+  });
+
+  it("defaults to none when the dest has no kyc_server", () => {
+    const r = parseCorridor(valid);
+    expect(r.ok && complianceMethod(r.value)).toBe("none");
+  });
+
+  it("is derived, not written into the parsed manifest, so existing hashes are unchanged", () => {
+    const r = parseCorridor(withDest({ kyc_server: "https://d.example/sep12" }));
+    expect(r.ok && r.value.compliance.method).toBeUndefined();
+  });
+
+  it("honours an explicit method over the derived default", () => {
+    const r = parseCorridor(
+      withDest(
+        { kyc_server: "https://d.example/sep12" },
+        { compliance: { ...valid.compliance, method: "bespoke" } },
+      ),
+    );
+    expect(r.ok && complianceMethod(r.value)).toBe("bespoke");
+  });
+
+  it("rejects an unknown method", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "email" },
+    });
+    expect(!r.ok && r.error.code).toBe("MANIFEST_INVALID");
+  });
+
+  it("rejects sep12 on a dest with no kyc_server", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "sep12" },
+    });
+    expect(!r.ok && r.error.message).toContain("requires dest.endpoints.kyc_server");
+  });
+
+  it("rejects sep6_fields on a non-SEP-6 dest", () => {
+    const r = parseCorridor({
+      ...valid,
+      compliance: { ...valid.compliance, method: "sep6_fields" },
+    });
+    expect(!r.ok && r.error.message).toContain('requires dest.protocol "sep6"');
   });
 });
 

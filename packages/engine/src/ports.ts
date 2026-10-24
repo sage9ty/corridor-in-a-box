@@ -31,15 +31,6 @@ export interface SettlementRequest {
   readonly corridor: Corridor;
   /** Epoch ms after which a firm quote expires and settlement must not land on-chain. */
   readonly validUntil?: number;
-  /** Optional asset the receiving anchor actually wants to receive.
-   *  When set and different from `amount.asset`, the submitter must route through
-   *  the DEX using `pathPaymentStrictSend`. */
-  readonly receiveAsset?: Money;
-  /** Maximum acceptable slippage in basis points for the path payment. */
-  readonly maxSlippageBps?: number;
-  /** Minimum amount the anchor's firm quote requires at the destination.
-   *  The submitter must fail closed if `destMin` would be below this. */
-  readonly minDestAmount?: Money;
 }
 
 export interface RefundRequest {
@@ -107,12 +98,10 @@ export class InMemoryWaker implements ReconcileWaker {
         return self.aborted.has(transactionId);
       },
       addEventListener(type: "abort", cb: () => void) {
-        if (type !== "abort") return;
         if (!self.listeners.has(transactionId)) self.listeners.set(transactionId, new Set());
         self.listeners.get(transactionId)!.add(cb);
       },
       removeEventListener(type: "abort", cb: () => void) {
-        if (type !== "abort") return;
         self.listeners.get(transactionId)?.delete(cb);
       },
       reset() {
@@ -122,7 +111,7 @@ export class InMemoryWaker implements ReconcileWaker {
   }
 
   wake(transactionId: string) {
-    self.aborted.add(transactionId);
+    this.aborted.add(transactionId);
     const set = this.listeners.get(transactionId);
     if (set) {
       for (const cb of set) cb();
@@ -169,11 +158,26 @@ export interface SettlementStrategy {
   /** Must match `DepositInstructionsKind`. The engine picks the first strategy
    *  whose `kind` equals the deposit instructions kind on the opened tx. */
   readonly kind: DepositInstructionsKind;
-  /** Optional predicate that lets a strategy claim a settlement whose kind
-   *  matches but whose asset routing requires this strategy (e.g. a different
-   *  receive asset). When omitted, the strategy applies to any tx of its `kind`. */
+  /** Optional second filter after `kind`: return false to leave this settlement
+   *  to another strategy of the same kind (e.g. a plain payment declining a
+   *  corridor whose anchor receives a different asset). Omitted = accept all. */
   matches?(ctx: SettlementStrategyContext): boolean;
   settle(ctx: SettlementStrategyContext): Promise<Outcome<SettlementRef>>;
+}
+
+/**
+ * True when the corridor's anchor receives a different on-chain asset than the
+ * bridge asset we hold (`settlement.receive_asset`), so a plain payment would
+ * deliver the wrong asset and the settle leg must path-pay through the DEX.
+ */
+export function needsPathPayment(corridor: Corridor): boolean {
+  const { bridge_asset, asset_issuer, receive_asset, receive_asset_issuer } =
+    corridor.settlement;
+  if (receive_asset === undefined) return false;
+  const bridgeIsXlm = bridge_asset.toUpperCase() === "XLM";
+  const receiveIsXlm = receive_asset.toUpperCase() === "XLM";
+  if (bridgeIsXlm || receiveIsXlm) return bridgeIsXlm !== receiveIsXlm;
+  return receive_asset !== bridge_asset || receive_asset_issuer !== asset_issuer;
 }
 
 /**
@@ -189,16 +193,10 @@ export class StellarPaymentStrategy implements SettlementStrategy {
 
   constructor(private readonly submitter: SettlementSubmitter) {}
 
-  /**
-   * Only claim the settlement when the bridge asset is the asset the anchor
-   * receives. When the manifest declares a different `receive_asset`, the
-   * path-payment strategy handles it instead.
-   */
+  /** A plain payment delivers the bridge asset, so it declines a corridor whose
+   *  anchor receives something else — that is a path payment's job. */
   matches({ corridor }: SettlementStrategyContext): boolean {
-    const receiveAsset = corridor.settlement?.receive_asset;
-    const bridgeAsset = corridor.settlement?.bridge_asset;
-    if (!receiveAsset) return true;
-    return receiveAsset === bridgeAsset;
+    return !needsPathPayment(corridor);
   }
 
   async settle({
@@ -267,15 +265,21 @@ export function defaultStrategies(
 
 /**
  * Default port. Returns a clear, actionable error pointing at the one integration
- * you owe. Replace with a StellarSubmitter built on @stellar/stellar-sdk: the
- * submitter builds either a native payment or a pathPaymentStrictSend
- * depending on whether the anchor's receive asset differs from the bridge asset.
+ * you owe. Replace with a StellarSubmitter built on @stellar/stellar-sdk:
+ *
+ *   const tx = new TransactionBuilder(source, { fee, networkPassphrase })
+ *     .addOperation(Operation.payment({ destination: req.to, asset, amount: req.amount.amount }))
+ *     .addMemo(req.memo ? Memo.text(req.memo) : Memo.none())
+ *     .setTimeout(req.corridor.fx.quote_ttl_seconds)   // beat the firm-quote expiry
+ *     .build();
+ *   tx.sign(keypair);
+ *   const res = await server.submitTransaction(tx);
  */
 export class UnimplementedSubmitter implements SettlementSubmitter {
   async submit(): Promise<Outcome<SettlementRef>> {
     return fail(
       "SETTLEMENT_FAILED",
-      "settlement not wired: implement SettlementSubmitter with @stellar/stellar-sdk (native payment or pathPaymentStrictSend to the anchor deposit address)",
+      "settlement not wired: implement SettlementSubmitter with @stellar/stellar-sdk (native payment to the anchor deposit address)",
     );
   }
 
@@ -318,8 +322,7 @@ export function createMockSubmitter(
           request.memo === req.memo &&
           request.memoType === req.memoType &&
           request.amount.asset === req.amount.asset &&
-          request.amount.amount === req.amount.amount &&
-          request.receiveAsset?.asset === req.receiveAsset?.asset,
+          request.amount.amount === req.amount.amount,
       );
       return ok(found?.reference);
     },

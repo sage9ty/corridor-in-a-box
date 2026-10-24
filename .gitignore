@@ -4,8 +4,6 @@ dist/
 *.tsbuildinfo
 *.log
 .DS_Store
-.env
-.env.local
 MAINTAINER.md
 
 # Rust / Soroban build output
@@ -14,3 +12,4 @@ contracts/target/
 # soroban-sdk testutils auto-generated ledger-state dumps: regenerate every
 # `cargo test` run, never read back by test code, not meant to be committed.
 contracts/*/test_snapshots/
+config.bat

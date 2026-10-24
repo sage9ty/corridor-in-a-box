@@ -6,7 +6,7 @@
 // bespoke integrations implement this same interface and (in the real product)
 // could be implemented separately; no private implementation is included here.
 
-import type { Corridor } from "@corridor/manifest";
+import type { ComplianceMethod, Corridor } from "@corridor/manifest";
 import {
   applyPrice,
   compareAmounts,
@@ -23,6 +23,8 @@ import {
 
 export { type SettlementRef, settlementId };
 export { Sep10Client, jwtExpiryMs, type Sep10Signer } from "./sep10";
+export { Sep12ComplianceCheck, type Sep12ComplianceCheckOptions } from "./sep12";
+export type { ComplianceMethod };
 
 /** A SEP-38 quote. `firm` quotes carry an id + expiry and bind the deliverer to a rate. */
 export interface Quote {
@@ -300,7 +302,8 @@ export interface RefundRef {
 export interface AdapterCapabilities {
   readonly protocol: string;
   readonly quotes: readonly ("sep38_firm" | "sep38_indicative" | "native" | "none")[];
-  readonly kyc: "sep12" | "sep6_fields" | "bespoke" | "none";
+  /** Same vocabulary as the manifest's `compliance.method`. */
+  readonly kyc: ComplianceMethod;
   readonly settlement: readonly DepositInstructions["kind"][];
   readonly refunds: "request" | "report_only" | "none";
   readonly callbacks: boolean;
@@ -605,6 +608,45 @@ export interface AnchorAdapter {
     amount: Money,
     reason: string,
   ): Promise<Outcome<RefundRef>>;
+}
+
+/**
+ * Adapter for the source anchor's deposit/on-ramp transaction.
+ * `openDeposit` must be idempotent on `intent.idempotencyKey`, so a crash
+ * after the source accepts the deposit but before its id is stored is safe to
+ * resume.
+ */
+export interface SourceAnchorAdapter {
+  openDeposit(
+    intent: PaymentIntent,
+    corridor: Corridor,
+  ): Promise<Outcome<{ transactionId: string }>>;
+  getDeposit(transactionId: string): Promise<Outcome<TransactionStatus>>;
+}
+
+/** Configurable source adapter for engine tests. */
+export function createMockSourceAdapter(
+  opts: { settled?: boolean } = {},
+): SourceAnchorAdapter {
+  let counter = 0;
+  const deposits = new Map<string, boolean>();
+  const byKey = new Map<string, string>();
+  return {
+    async openDeposit(intent) {
+      const existing = byKey.get(intent.idempotencyKey);
+      if (existing) return ok({ transactionId: existing });
+      const transactionId = `source-deposit-${++counter}`;
+      deposits.set(transactionId, opts.settled ?? true);
+      byKey.set(intent.idempotencyKey, transactionId);
+      return ok({ transactionId });
+    },
+    async getDeposit(transactionId) {
+      const settled = deposits.get(transactionId);
+      if (settled === undefined)
+        return fail("ANCHOR_UNAVAILABLE", `unknown source deposit ${transactionId}`);
+      return ok({ status: settled ? "completed" : "pending_sender", settled });
+    },
+  };
 }
 
 // --- Conformance ---------------------------------------------------------

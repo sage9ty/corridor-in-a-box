@@ -16,7 +16,7 @@ import {
   type Outcome,
   type PaymentIntent,
 } from "@corridor/types";
-import type { RouteResolver } from "@corridor/router";
+import type { RouteDecision, RouteResolver } from "@corridor/router";
 import {
   AdapterQuoteProvider,
   ExternalQuoteProvider,
@@ -55,7 +55,11 @@ import {
   watchRefund,
   settleQuoteProblem,
 } from "./verbs";
-import type { AnchorAdapter, TransactionStatus } from "@corridor/adapter-kit";
+import type {
+  AnchorAdapter,
+  SourceAnchorAdapter,
+  TransactionStatus,
+} from "@corridor/adapter-kit";
 import { defaultStrategies } from "./ports";
 import { checkCompatibility } from "./compat";
 import {
@@ -102,13 +106,6 @@ export interface EngineDeps {
    * returned by the receiving anchor.
    */
   strategies?: readonly SettlementStrategy[];
-  /**
-   * Optional factory used to build a `StellarPathPaymentStrategy` when the
-   * corridor's `settlement.receive_asset` differs from `bridge_asset`. The
-   * engine selects it automatically in that case; the factory lets callers
-   * inject a fake Horizon for tests.
-   */
-  pathPaymentStrategy?: (submitter: SettlementSubmitter) => SettlementStrategy;
   idempotency?: IdempotencyStore;
   waker?: import("./ports").ReconcileWaker;
   now?: () => number;
@@ -477,7 +474,13 @@ export async function execute(
   }
 
   // --- pick the receiving anchor ---------------------------------------
-  const route = await deps.resolver.resolve(intent, corridor);
+  // The key is already claimed, so a refusal must still finish the run: left in
+  // `created` it would answer every retry with IDEMPOTENCY_CONFLICT forever.
+  const routed = await resolveRoute(deps.resolver, intent, corridor);
+  if (!routed.ok) {
+    return failRun({ run, trail, deps, store, now, recordOutcome }, routed.error);
+  }
+  const route = routed.value;
   const routeTrust = route.trust;
   const adapter = route.receiving;
   const context = createRunContext({
@@ -495,20 +498,8 @@ export async function execute(
   });
   const { advance, die, finishFailure } = context;
 
+  const strategies = deps.strategies ?? defaultStrategies(deps.submitter, adapter);
   const caps = adapter.capabilities();
-  // When the corridor declares a `receive_asset` different from the bridge
-  // asset, the settle must route through the DEX via pathPaymentStrictSend.
-  // Prefer an explicitly supplied strategy list; otherwise build the path
-  // strategy (or fall back to the default strategies when no factory is
-  // wired, which keeps existing callers working).
-  const receiveAsset = corridor.settlement.receive_asset;
-  const needsPath =
-    receiveAsset !== undefined && receiveAsset !== corridor.settlement.bridge_asset;
-  const strategies =
-    deps.strategies ??
-    (needsPath && deps.pathPaymentStrategy
-      ? [deps.pathPaymentStrategy(deps.submitter)]
-      : defaultStrategies(deps.submitter, adapter));
   const compat = checkCompatibility(corridor, caps, strategies);
   if (!compat.ok) {
     return die({
@@ -605,6 +596,46 @@ export async function execute(
     if (!t.ok) return die(t.error);
   }
 
+  // Keep dry runs value-free: they never open a source deposit.
+  if (opts.dryRun && corridor.source.protocol !== "prefunded") {
+    return die({
+      code: "DRY_RUN_COMPLETE",
+      message:
+        "dry run stopped before source funding; non-prefunded gate checks require a funded treasury",
+      retryable: false,
+      cause: { dryRun: true, checks: [] },
+    });
+  }
+
+  // Source funding precedes the destination balance/gate checks so the
+  // treasury is actually funded when those checks inspect its balance.
+  if (corridor.source.protocol !== "prefunded") {
+    if (!route.sending) {
+      return die({
+        code: "ENGINE_MISCONFIGURED",
+        message: `corridor ${corridor.id} requires a sending adapter for protocol ${corridor.source.protocol}`,
+        retryable: false,
+      });
+    }
+    const funding = await advance("funding");
+    if (!funding.ok) return die(funding.error);
+    const deposit = await route.sending.openDeposit(intent, corridor);
+    if (!deposit.ok) return finishFailure(deposit.error);
+    run.sourceTransactionId = deposit.value.transactionId;
+    run.version += 1;
+    await store.put(run);
+    const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
+      now,
+      sleep,
+      deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+      pollMs,
+      stallThreshold,
+    });
+    if (!funded.ok) return finishFailure(funded.error);
+    const markedFunded = await advance("funded");
+    if (!markedFunded.ok) return die(markedFunded.error);
+  }
+
   // The whole settle+reconcile phase must finish inside the corridor's timeout.
   const deadlineMs = now() + corridor.recovery.timeout_seconds * 1000;
 
@@ -626,11 +657,13 @@ export async function execute(
     // quote's price with no error. There's no "retry into a fresh quote"
     // step in this loop, so once expired there's nothing safe to retry into.
     if (q.value.firm && q.value.expiresAt <= now()) {
-      return finishFailure({
+      const expired = {
         code: "QUOTE_EXPIRED",
         message: `quote ${q.value.id} expired during retry`,
         retryable: false,
-      });
+      } as const;
+      if (run.sourceTransactionId) return context.holdAndStop(expired);
+      return finishFailure(expired);
     }
 
     // The same check settle() makes, done here too so a bad quote dies before the run ever reaches
@@ -656,11 +689,13 @@ export async function execute(
       } catch (e) {
         // Record the attempt at the gate so the audit trail shows where it died.
         await advance("verifying");
-        return die({
+        const gateError = {
           code: "SETTLEMENT_FAILED",
           message: e instanceof Error ? e.message : String(e),
           retryable: false,
-        });
+        } as const;
+        if (run.sourceTransactionId) return context.holdAndStop(gateError);
+        return die(gateError);
       }
       gateChecks = gateResult.results;
       for (const check of gateChecks) {
@@ -675,14 +710,13 @@ export async function execute(
       }
       if (!gateResult.passed) {
         const failure = gateChecks.find((r) => !r.passed)!;
-        return die(
-          {
-            code: failure.code ?? "SETTLEMENT_FAILED",
-            message: failure.detail,
-            retryable: false,
-          },
-          gateChecks,
-        );
+        const gateError = {
+          code: failure.code ?? "SETTLEMENT_FAILED",
+          message: failure.detail,
+          retryable: false,
+        } as const;
+        if (run.sourceTransactionId) return context.holdAndStop(gateError);
+        return die(gateError, gateChecks);
       }
     } else {
       const skippedCheck: CheckResult = {
@@ -728,11 +762,24 @@ export async function execute(
       );
     }
 
+    // Funding can take long enough for a firm destination quote to expire.
+    // Check again after the gate and immediately before settlement.
+    if (q.value.firm && q.value.expiresAt <= now()) {
+      const expired = {
+        code: "QUOTE_EXPIRED" as const,
+        message: `quote ${q.value.id} expired before settlement after source funding`,
+        retryable: false,
+      };
+      if (run.sourceTransactionId) return context.holdAndStop(expired);
+      return finishFailure(expired);
+    }
+
     {
       const t = await advance("settling");
       if (!t.ok) return die(t.error);
     }
 
+    const strategies = deps.strategies ?? defaultStrategies(deps.submitter, adapter);
     let s: Outcome<SettlementRef>;
     const instructionsKind = opened.value.instructions?.kind ?? "stellar_payment";
     if (deps.submitter.findExisting && instructionsKind === "stellar_payment") {
@@ -778,7 +825,6 @@ export async function execute(
       memo: settleReq.memo,
       memoType: settleReq.memoType,
       amount: settleReq.amount,
-      ...(settleReq.receiveAsset && { receiveAsset: settleReq.receiveAsset }),
     };
     {
       const t = await advance("settled", {
@@ -829,6 +875,25 @@ export async function execute(
   return ok(toResult(run, trail));
 }
 
+async function waitForSourceDeposit(
+  source: SourceAnchorAdapter,
+  transactionId: string,
+  opts: {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    deadlineMs: number;
+    pollMs: number;
+    stallThreshold: number;
+  },
+): Promise<Outcome<void>> {
+  const result = await reconcileUntil(
+    { getTransaction: (id) => source.getDeposit(id) },
+    transactionId,
+    opts,
+  );
+  return result.ok ? ok(undefined) : result;
+}
+
 async function emitVerification(
   deps: EngineDeps,
   intent: PaymentIntent,
@@ -864,14 +929,6 @@ function settlementRequestFor(
     memo: legacy.memo,
     memoType: legacy.memoType,
     amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
-    ...(corridor.settlement.receive_asset && {
-      receiveAsset: {
-        asset: corridor.settlement.receive_asset,
-        ...(corridor.settlement.receive_asset_issuer && {
-          issuer: corridor.settlement.receive_asset_issuer,
-        }),
-      },
-    }),
     corridor,
   };
 }
@@ -964,26 +1021,7 @@ function createRunContext(init: RunContextInit): RunContext {
     return ok(undefined);
   };
 
-  const die: RunContext["die"] = async (error, checks) => {
-    if (!canTransition(run.state, "failed")) return { ok: false, error };
-    const from = run.state;
-    run.lastError = `${error.code}: ${error.message}`;
-    run.state = "failed";
-    run.version += 1;
-    trail.push("failed");
-    await store.put(run);
-    await emitTransition(
-      deps,
-      run,
-      from,
-      now(),
-      run.lastError,
-      routeTrust,
-      checks ? { checks } : undefined,
-    );
-    await recordOutcome("failed", error);
-    return { ok: false, error };
-  };
+  const die: RunContext["die"] = (error, checks) => failRun(init, error, checks);
 
   const holdAndStop: RunContext["holdAndStop"] = async (
     error,
@@ -1115,6 +1153,62 @@ function createRunContext(init: RunContextInit): RunContext {
   };
 
   return { advance, die, finishFailure, holdAndStop, recordOutcome };
+}
+
+/**
+ * Move a run to `failed`, persist it and audit the transition: the body of
+ * `die`. Standalone so a run whose route was refused, which has no adapter and
+ * so no run context, takes exactly the same path.
+ */
+async function failRun(
+  init: Pick<
+    RunContextInit,
+    "run" | "trail" | "deps" | "store" | "now" | "routeTrust" | "recordOutcome"
+  >,
+  error: CorridorError,
+  checks?: readonly CheckResult[],
+): Promise<Err> {
+  const { run, trail, deps, store, now, routeTrust, recordOutcome } = init;
+  if (!canTransition(run.state, "failed")) return { ok: false, error };
+  const from = run.state;
+  run.lastError = `${error.code}: ${error.message}`;
+  run.state = "failed";
+  run.version += 1;
+  trail.push("failed");
+  await store.put(run);
+  await emitTransition(
+    deps,
+    run,
+    from,
+    now(),
+    run.lastError,
+    routeTrust,
+    checks ? { checks } : undefined,
+  );
+  await recordOutcome("failed", error);
+  return { ok: false, error };
+}
+
+/**
+ * Ask the resolver for a route, turning a throw into ROUTE_REFUSED. Resolvers
+ * fail closed by throwing (`UnattestedAnchorError`), and a third-party one may
+ * throw for any reason; either way the engine must still own the run's state.
+ * Not retryable: the same payment would be refused the same way.
+ */
+async function resolveRoute(
+  resolver: RouteResolver,
+  intent: PaymentIntent,
+  corridor: Corridor,
+): Promise<Outcome<RouteDecision>> {
+  try {
+    return ok(await resolver.resolve(intent, corridor));
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return fail("ROUTE_REFUSED", `route resolver refused corridor ${corridor.id}: ${reason}`, {
+      retryable: false,
+      cause,
+    });
+  }
 }
 
 function toResult(run: StoredRun, trail: readonly CorridorState[]): RunResult {
@@ -1253,7 +1347,18 @@ async function resumeRun(
       `idempotencyKey ${run.idempotencyKey} cannot resume state=${run.state}: ${detail}`,
     );
 
-  const route = await deps.resolver.resolve(intent, corridor);
+  const routed = await resolveRoute(deps.resolver, intent, corridor);
+  if (!routed.ok) {
+    // A run that stopped before opening a receiving transaction moved no money
+    // and would be failed as RESUME_STALE below anyway, so fail it now. Any
+    // later state may have money on the chain or in flight (a `settled` run
+    // still has to reconcile): leave the stored row untouched and resumable.
+    if (run.state === "created" || run.state === "quoted" || run.state === "compliant") {
+      return failRun({ run, trail, deps, store, now, recordOutcome }, routed.error);
+    }
+    return routed;
+  }
+  const route = routed.value;
   const context = createRunContext({
     run,
     trail,
@@ -1307,8 +1412,42 @@ async function resumeRun(
     });
   }
 
+  if (run.state === "funding") {
+    if (!route.sending) return conflict("source adapter is unavailable");
+    if (!run.sourceTransactionId) {
+      // The adapter contract requires idempotency by the run key. This covers
+      // a crash after the anchor accepted openDeposit but before we persisted
+      // the returned transaction id.
+      const deposit = await route.sending.openDeposit(intent, corridor);
+      if (!deposit.ok) return context.finishFailure(deposit.error);
+      run.sourceTransactionId = deposit.value.transactionId;
+      run.version += 1;
+      await store.put(run);
+    }
+    const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
+      now,
+      sleep,
+      deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+      pollMs,
+      stallThreshold,
+    });
+    if (!funded.ok) return context.finishFailure(funded.error);
+    const advanced = await context.advance("funded");
+    if (!advanced.ok) return advanced;
+  }
+
+  if (run.state === "funded" && deps.gate) {
+    // `funded` is before the destination gate. The persisted row does not
+    // contain the full quote/open objects needed to safely reconstruct its
+    // context, so never settle through a gate that cannot be re-evaluated.
+    return conflict(
+      "pre-settle gate cannot be re-evaluated on resume; operator review needed",
+    );
+  }
+
   if (
     run.state === "opened" ||
+    run.state === "funded" ||
     run.state === "retrying" ||
     run.state === "verifying" ||
     run.state === "settling"
@@ -1321,6 +1460,13 @@ async function resumeRun(
       run.quoteFirm === undefined
     ) {
       return conflict("persisted quote/open data is incomplete");
+    }
+    if (run.state === "funded" && run.quoteFirm && run.quoteExpiresAt <= now()) {
+      return context.holdAndStop({
+        code: "QUOTE_EXPIRED",
+        message: `stored quote ${run.quoteId ?? "(unknown)"} expired during source funding`,
+        retryable: false,
+      });
     }
     if (!deps.submitter.findExisting) {
       return conflict("settlement submitter does not support findExisting");
@@ -1338,6 +1484,10 @@ async function resumeRun(
     // Walk the legal path up to `settling` (opened/retrying -> verifying ->
     // settling), as a fresh run would: the table in state.ts stays the guard.
     const enterSettling = async (): Promise<Outcome<void>> => {
+      if (run.state === "funded") {
+        const verifying = await context.advance("verifying");
+        if (!verifying.ok) return verifying;
+      }
       if (run.state === "opened" || run.state === "retrying") {
         const verifying = await context.advance("verifying");
         if (!verifying.ok) return verifying;
@@ -1348,6 +1498,9 @@ async function resumeRun(
 
     let ref: SettlementRef | undefined;
     if (found.value) {
+      if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
+        return conflict("an existing settlement has no recorded source deposit reference");
+      }
       // A payment matching this exact request already exists: money moved
       // before the crash, so do not submit again.
       const entered = await enterSettling();
@@ -1387,6 +1540,41 @@ async function resumeRun(
       if (route.receiving.capabilities().kyc !== "none") {
         const compliance = await comply(route.receiving, intent, corridor);
         if (!compliance.ok) return context.die(compliance.error);
+      }
+      if (corridor.source.protocol !== "prefunded" && !run.sourceTransactionId) {
+        if (!route.sending) return conflict("source adapter is unavailable");
+        if (run.state !== "opened") return conflict("cannot safely enter source funding");
+        const funding = await context.advance("funding");
+        if (!funding.ok) return context.die(funding.error);
+        const deposit = await route.sending.openDeposit(intent, corridor);
+        if (!deposit.ok) return context.finishFailure(deposit.error);
+        run.sourceTransactionId = deposit.value.transactionId;
+        run.version += 1;
+        await store.put(run);
+        const funded = await waitForSourceDeposit(route.sending, run.sourceTransactionId, {
+          now,
+          sleep,
+          deadlineMs: now() + corridor.recovery.timeout_seconds * 1000,
+          pollMs,
+          stallThreshold,
+        });
+        if (!funded.ok) return context.finishFailure(funded.error);
+        const markedFunded = await context.advance("funded");
+        if (!markedFunded.ok) return context.die(markedFunded.error);
+      }
+      if (run.quoteFirm && run.quoteExpiresAt <= now()) {
+        if (run.sourceTransactionId) {
+          return context.holdAndStop({
+            code: "QUOTE_EXPIRED",
+            message: `stored quote ${run.quoteId ?? "(unknown)"} expired before settlement`,
+            retryable: false,
+          });
+        }
+        return context.finishFailure({
+          code: "QUOTE_EXPIRED",
+          message: `stored quote ${run.quoteId ?? "(unknown)"} expired before settlement`,
+          retryable: false,
+        });
       }
       const entered = await enterSettling();
       if (!entered.ok) return context.die(entered.error);

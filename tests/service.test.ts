@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
-import { StaticRouteResolver } from "@corridor/router";
+import { StaticRouteResolver, UnattestedAnchorError } from "@corridor/router";
 import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
@@ -200,6 +200,11 @@ describe("service: strict payment body validation", () => {
       field: "recipient.sep12Id",
     },
     {
+      name: "a non-string recipient.anchorCustomerId",
+      body: { ...full(), recipient: { id: "r", anchorCustomerId: 7 } },
+      field: "recipient.anchorCustomerId",
+    },
+    {
       name: "a non-string recipient.id",
       body: { ...full(), recipient: { id: null } },
       field: "recipient.id",
@@ -278,6 +283,18 @@ describe("service: strict payment body validation", () => {
     expect(out.field).toBe("sourceAmount.asset");
   });
 
+  it("accepts recipient.anchorCustomerId alongside the deprecated sep12Id", async () => {
+    const r = await svc().route({
+      method: "POST",
+      path: "/payments",
+      body: {
+        ...intentBody("party-ref-ok"),
+        recipient: { id: "r", sep12Id: "legacy-1", anchorCustomerId: "neutral-1" },
+      },
+    });
+    expect(r.status).toBe(200);
+  });
+
   it("still accepts a well-formed body end to end", async () => {
     const r = await svc().route({
       method: "POST",
@@ -289,6 +306,32 @@ describe("service: strict payment body validation", () => {
     });
     expect(r.status).toBe(200);
     expect((r.body as { state: string }).state).toBe("completed");
+  });
+});
+
+describe("service: refused route", () => {
+  it("answers 503 ROUTE_REFUSED and records the run as failed", async () => {
+    const s = svc({
+      deps: {
+        ...deps(),
+        resolver: {
+          async resolve() {
+            throw new UnattestedAnchorError("d.example", "no attestation on file");
+          },
+        },
+      },
+    });
+    const r = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("refused"),
+    });
+    expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("ROUTE_REFUSED");
+
+    const run = await s.route({ method: "GET", path: "/payments/refused" });
+    expect(run.status).toBe(200);
+    expect((run.body as { state: string }).state).toBe("failed");
   });
 });
 

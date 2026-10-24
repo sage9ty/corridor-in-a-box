@@ -79,6 +79,34 @@ describe("checkCompatibility", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("ignores caps.kyc when the manifest declares no compliance.method", () => {
+    const res = checkCompatibility(
+      testCorridor(),
+      { ...validCaps, kyc: "none" },
+      defaultStrategies,
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("fails closed when an explicit compliance.method disagrees with caps.kyc", () => {
+    // A manifest that says "none" must not switch off KYC the adapter enforces.
+    const corridor = testCorridor({
+      compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR", method: "none" },
+    });
+    const res = checkCompatibility(corridor, validCaps, defaultStrategies);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("CAPABILITY_MISMATCH");
+      expect(res.error.message).toContain('compliance.method "none"');
+    }
+    const agreed = checkCompatibility(
+      corridor,
+      { ...validCaps, kyc: "none" },
+      defaultStrategies,
+    );
+    expect(agreed.ok).toBe(true);
+  });
+
   it("fails when adapter settlement is empty", () => {
     const caps: AdapterCapabilities = {
       ...validCaps,

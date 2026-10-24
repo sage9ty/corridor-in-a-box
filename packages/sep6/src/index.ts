@@ -27,6 +27,7 @@
 
 import type { Corridor, Sep6Anchor } from "@corridor/manifest";
 import {
+  anchorCustomerIdOf,
   fail,
   isValidAmount,
   ok,
@@ -36,6 +37,7 @@ import {
 } from "@corridor/types";
 import {
   parseRefunds,
+  Sep12ComplianceCheck,
   totalPriceProblem,
   type AdapterCapabilities,
   type AnchorAdapter,
@@ -405,6 +407,8 @@ export class Sep6Adapter implements AnchorAdapter {
   /** Asset code `/info` keys by, derived from `dest.asset`. */
   private readonly destAssetCode: string;
   private cachedInfo?: Sep6Info;
+  /** SEP-12 status read, shared with @corridor/sep31; absent without a `kyc_server`. */
+  private readonly sep12?: Sep12ComplianceCheck;
 
   constructor(corridor: Corridor, opts: Sep6AdapterOptions = {}) {
     if (corridor.dest.protocol !== "sep6") {
@@ -425,6 +429,15 @@ export class Sep6Adapter implements AnchorAdapter {
     this.transferServer = this.anchor.endpoints.transfer_server;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.sep10 = opts.sep10;
+    const kycServer = this.anchor.endpoints.kyc_server;
+    if (kycServer) {
+      this.sep12 = new Sep12ComplianceCheck({
+        kycServer,
+        name: this.name,
+        fetchImpl: this.fetchImpl,
+        authToken: () => this.authToken(),
+      });
+    }
   }
 
   // SEP-10 challenge/response: GET a challenge transaction, sign it, POST it back
@@ -656,63 +669,27 @@ export class Sep6Adapter implements AnchorAdapter {
   }
 
   /**
-   * SEP-12 status read for the recipient — the same faithful `GET /customer`
-   * @corridor/sep31 does, and nothing more. The ComplianceStrategy design
-   * (who registers, which party, what a SEP-6 anchor expects when no
-   * kyc_server is configured) is issue #193; without a kyc_server we refuse
-   * rather than assume a 1:1 KYC-less corridor.
+   * SEP-12 status read for the recipient, through the same
+   * `Sep12ComplianceCheck` @corridor/sep31 uses (#193). Without a kyc_server
+   * we refuse rather than assume a 1:1 KYC-less corridor: inline
+   * `compliance.method: sep6_fields` KYC is not implemented yet.
    */
   async ensureCompliance(
     intent: PaymentIntent,
     corridor: Corridor,
   ): Promise<Outcome<KycResult>> {
-    const kyc = this.anchor.endpoints.kyc_server;
-    if (!kyc) {
+    if (!this.sep12) {
       return fail(
         "KYC_REQUIRED",
-        `${this.name}: SEP-6 dest configures no SEP-12 kyc_server — compliance routing for ` +
-          `SEP-6 corridors is issue #193. Refusing to assume this lane needs no KYC.`,
+        `${this.name}: SEP-6 dest configures no SEP-12 kyc_server, and inline SEP-6 KYC ` +
+          `fields (compliance.method "sep6_fields") are not supported yet (#193). ` +
+          `Refusing to assume this lane needs no KYC.`,
       );
     }
-    const sep12Id = intent.recipient.sep12Id;
-    if (!sep12Id) {
-      return fail(
-        "KYC_REQUIRED",
-        `${this.name}: recipient has no SEP-12 customer id — register the receiver ` +
-          `with this anchor (SEP-12 PUT /customer) and set recipient.sep12Id before ` +
-          `settling. Refusing to settle on an unverified recipient.`,
-      );
-    }
-    const auth = await this.authToken();
-    if (!auth.ok) return auth;
-    try {
-      const url = new URL(`${kyc}/customer`);
-      url.searchParams.set("id", sep12Id);
-      url.searchParams.set("type", corridor.compliance.sep12_receiver_type);
-      const res = await this.fetchImpl(url.toString(), {
-        headers: this.authHeader(auth.value),
-      });
-      if (!res.ok) {
-        return fail("KYC_REQUIRED", `${this.name}: SEP-12 customer HTTP ${res.status}`, {
-          retryable: res.status >= 500,
-        });
-      }
-      const j = (await jsonBody(res)) as { id?: unknown; status?: unknown } | undefined;
-      const status = (nonEmptyString(j?.status) ?? "").toUpperCase();
-      if (status === "ACCEPTED") {
-        return ok<KycResult>({ status: "accepted", customerId: nonEmptyString(j?.id) });
-      }
-      if (status === "REJECTED") {
-        return ok<KycResult>({ status: "rejected", customerId: nonEmptyString(j?.id) });
-      }
-      // PROCESSING, NEEDS_INFO, or anything unknown → not yet cleared.
-      return ok<KycResult>({ status: "pending", customerId: nonEmptyString(j?.id) });
-    } catch (cause) {
-      return fail("ANCHOR_UNAVAILABLE", `${this.name}: SEP-12 request failed`, {
-        retryable: true,
-        cause,
-      });
-    }
+    return this.sep12.check(
+      anchorCustomerIdOf(intent.recipient),
+      corridor.compliance.sep12_receiver_type,
+    );
   }
 
   /**
@@ -740,12 +717,12 @@ export class Sep6Adapter implements AnchorAdapter {
     // `customer_id` — with none of the three it cannot even answer
     // GET /transaction for us later. Fail before touching the network.
     const account = this.sep10?.account;
-    const customerId = intent.recipient.sep12Id;
+    const customerId = anchorCustomerIdOf(intent.recipient);
     if (!account && !customerId) {
       return fail(
         "KYC_REQUIRED",
         `${this.name}: cannot open a SEP-6 withdrawal with neither a SEP-10 signer nor ` +
-          `recipient.sep12Id — the anchor would have no way to attribute the ` +
+          `recipient.anchorCustomerId — the anchor would have no way to attribute the ` +
           `transaction. Refusing to open it unattributed.`,
       );
     }
