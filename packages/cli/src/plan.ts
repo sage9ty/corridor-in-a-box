@@ -8,6 +8,7 @@
 import {
   liveness,
   protocolOf,
+  type ComplianceMethod,
   type Corridor,
   type DestProtocol,
   type Liveness,
@@ -27,7 +28,7 @@ export interface PlanStep {
 }
 
 /** How customer compliance is handled for the destination leg. */
-export type ComplianceMethod = "sep12" | "sep6_fields" | "bespoke" | "none";
+export type { ComplianceMethod };
 
 export interface PlanSettlement {
   /** How the bridge asset reaches the destination anchor. */
@@ -88,6 +89,9 @@ function quoteStep(c: Corridor, protocol: DestProtocol): StepDraft {
 }
 
 function complianceMethod(c: Corridor): ComplianceMethod {
+  // An explicit manifest declaration wins; otherwise describe what the
+  // protocol's adapter will do.
+  if (c.compliance.method) return c.compliance.method;
   const endpoints = c.dest.endpoints;
   if ("kyc_server" in endpoints && endpoints.kyc_server) return "sep12";
   if (c.dest.protocol === "sep6") return "sep6_fields";

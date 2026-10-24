@@ -434,17 +434,20 @@ function recoveryTerminal(policy: Policy): CorridorState {
 }
 
 function expectedFor(step: Step, kind: Kind, policy: Policy): Expected {
-  // Pre-settle adapter throws are NOT caught by the verbs: execute() rejects and
-  // the row is left non-terminal with the key already claimed. Documented below.
+  // A resolver throw is caught by execute() (#257): the claimed row is failed
+  // with ROUTE_REFUSED rather than left in `created`.
   if (step === "resolve" && kind === "throw") {
     return {
-      rejects: true,
-      persisted: "created",
+      rejects: false,
+      terminal: "failed",
       money: 0,
       noSubmit: true,
+      code: "ROUTE_REFUSED",
       note: "route resolve throws before any verb runs",
     };
   }
+  // Pre-settle adapter throws are NOT caught by the verbs: execute() rejects and
+  // the row is left non-terminal with the key already claimed. Documented below.
   if (step === "quote") {
     if (kind === "throw")
       return { rejects: true, persisted: "created", money: 0, noSubmit: true };

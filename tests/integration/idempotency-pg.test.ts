@@ -96,6 +96,25 @@ run("PostgresIdempotencyStore (live Postgres)", () => {
     expect(got?.stellarTxHash).toBe("hash_rp");
   });
 
+  it("never lets a later write erase or replace a source transaction id", async () => {
+    const s = store();
+    await s.create(newRun("k-source"));
+    await s.put({
+      ...newRun("k-source"),
+      state: "funding",
+      version: 1,
+      sourceTransactionId: "source-1",
+    });
+    await s.put({ ...newRun("k-source"), state: "funded", version: 2 });
+    await s.put({
+      ...newRun("k-source"),
+      state: "funded",
+      version: 3,
+      sourceTransactionId: "source-2",
+    });
+    expect((await s.get("k-source"))?.sourceTransactionId).toBe("source-1");
+  });
+
   it("round-trips refundId", async () => {
     const s = store();
     await s.create(newRun("k-refund"));

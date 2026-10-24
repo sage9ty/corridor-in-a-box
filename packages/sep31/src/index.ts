@@ -15,6 +15,7 @@
 
 import type { Sep31Anchor, Corridor } from "@corridor/manifest";
 import {
+  anchorCustomerIdOf,
   fail,
   isValidAmount,
   ok,
@@ -30,6 +31,7 @@ import {
   type OpenTransaction,
   type Quote,
   type RefundRef,
+  Sep12ComplianceCheck,
   Sep38QuoteProvider,
   type TransactionStatus,
   parseRefunds,
@@ -159,6 +161,8 @@ export class Sep31Adapter implements AnchorAdapter {
   private readonly sep10: Sep10Client;
   private readonly sep10Signer?: Sep10Signer;
   private readonly sep38Provider: Sep38QuoteProvider;
+  /** SEP-12 status read; absent when the dest exposes no `kyc_server`. */
+  private readonly sep12?: Sep12ComplianceCheck;
 
   constructor(corridor: Corridor, opts: Sep31AdapterOptions = {}) {
     if (corridor.dest.protocol !== "sep31") {
@@ -184,6 +188,15 @@ export class Sep31Adapter implements AnchorAdapter {
       authToken: () => this.authToken(),
       quoteServer: () => this.anchor.endpoints.quote_server,
     });
+    const kycServer = this.anchor.endpoints.kyc_server;
+    if (kycServer) {
+      this.sep12 = new Sep12ComplianceCheck({
+        kycServer,
+        name: this.name,
+        fetchImpl: this.fetchImpl,
+        authToken: () => this.authToken(),
+      });
+    }
   }
 
   // SEP-10 challenge/response: GET a challenge transaction, sign it, POST it back
@@ -250,10 +263,10 @@ export class Sep31Adapter implements AnchorAdapter {
    * PII, hands it to the receiving anchor once, and thereafter refers to the
    * customer by opaque id. Keeping it off the port is what lets the engine
    * orchestrate payments without PII ever passing through it — `execute()` only
-   * ever sees a `sep12Id`.
+   * ever sees an opaque customer id.
    *
    * Call this from your deployment layer before `execute()`, and put the
-   * returned id on `intent.recipient.sep12Id`.
+   * returned id on `intent.recipient.anchorCustomerId`.
    *
    * `fields` are the SEP-12 fields the anchor asks for; which ones are required
    * comes from its `GET /customer` response and varies per anchor and per type.
@@ -308,63 +321,28 @@ export class Sep31Adapter implements AnchorAdapter {
     intent: PaymentIntent,
     corridor: Corridor,
   ): Promise<Outcome<KycResult>> {
-    const kyc = this.anchor.endpoints.kyc_server;
-    if (!kyc) {
+    if (!this.sep12) {
       // Some corridors deliver 1:1 with no per-customer KYC at the receiver.
       return ok<KycResult>({ status: "accepted" });
     }
     // SEP-12: check the receiving anchor's view of THE RECIPIENT's status. The
     // sending anchor collects/verifies PII and registers the customer with the
     // receiving anchor (SEP-12 PUT /customer), which returns the customer id we
-    // carry as `recipient.sep12Id`. Here we only read status — no PII flows
-    // through the engine. NEEDS_INFO / PROCESSING surface as "pending" so the
-    // engine fails closed rather than settling early.
+    // carry as `recipient.anchorCustomerId` (or the deprecated `sep12Id`). Here
+    // we only read status — no PII flows through the engine. NEEDS_INFO /
+    // PROCESSING surface as "pending" so the engine fails closed rather than
+    // settling early.
     //
     // This used to query `this.sep10?.account` — the OPERATOR's own signing
     // account — whenever a signer was configured, which is every production
     // wiring. It therefore answered "is the operator in good standing?" and
     // recorded the result as the recipient's KYC verdict: a compliance control
-    // that reported a pass without ever evaluating the customer. Fail closed
-    // instead when we have no id for the recipient.
-    const sep12Id = intent.recipient.sep12Id;
-    if (!sep12Id) {
-      return fail(
-        "KYC_REQUIRED",
-        `${this.name}: recipient has no SEP-12 customer id — register the receiver ` +
-          `with this anchor (SEP-12 PUT /customer) and set recipient.sep12Id before ` +
-          `settling. Refusing to settle on an unverified recipient.`,
-      );
-    }
-    const auth = await this.authToken();
-    if (!auth.ok) return auth;
-    try {
-      const url = new URL(`${kyc}/customer`);
-      url.searchParams.set("id", sep12Id);
-      url.searchParams.set("type", corridor.compliance.sep12_receiver_type);
-      const res = await this.fetchImpl(url.toString(), {
-        headers: this.authHeader(auth.value),
-      });
-      if (!res.ok) {
-        return fail("KYC_REQUIRED", `${this.name}: SEP-12 customer HTTP ${res.status}`, {
-          retryable: res.status >= 500,
-        });
-      }
-      const j = (await res.json()) as { id?: string; status?: string };
-      const status = (j.status ?? "").toUpperCase();
-      if (status === "ACCEPTED") {
-        return ok<KycResult>({ status: "accepted", customerId: j.id });
-      }
-      if (status === "REJECTED") {
-        return ok<KycResult>({ status: "rejected", customerId: j.id });
-      }
-      // PROCESSING, NEEDS_INFO, or anything unknown → not yet cleared.
-      return ok<KycResult>({ status: "pending", customerId: j.id });
-    } catch (cause) {
-      return fail("ANCHOR_UNAVAILABLE", `${this.name}: SEP-12 request failed`, {
-        retryable: true,
-        cause,
-      });
-    }
+    // that reported a pass without ever evaluating the customer. The shared
+    // check fails closed instead when we have no id for the recipient.
+    return this.sep12.check(
+      anchorCustomerIdOf(intent.recipient),
+      corridor.compliance.sep12_receiver_type,
+    );
   }
 
   async openTransaction(
@@ -378,12 +356,15 @@ export class Sep31Adapter implements AnchorAdapter {
     // receiver_id is the SEP-12 customer id from registration; without it a
     // conformant anchor rejects the transaction, and a lenient one would open a
     // payment with no identified beneficiary.
-    if (!intent.recipient.sep12Id) {
+    const receiverId = anchorCustomerIdOf(intent.recipient);
+    if (!receiverId) {
       return fail(
         "KYC_REQUIRED",
-        `${this.name}: cannot open a SEP-31 transaction without recipient.sep12Id`,
+        `${this.name}: cannot open a SEP-31 transaction without recipient.anchorCustomerId ` +
+          `(or the deprecated recipient.sep12Id)`,
       );
     }
+    const senderId = anchorCustomerIdOf(intent.sender);
     const auth = await this.authToken();
     if (!auth.ok) return auth;
     try {
@@ -404,8 +385,8 @@ export class Sep31Adapter implements AnchorAdapter {
           // request (400) if the transaction doesn't name the same buy asset.
           destination_asset: corridor.dest.asset,
           quote_id: quote.id,
-          receiver_id: intent.recipient.sep12Id,
-          ...(intent.sender.sep12Id ? { sender_id: intent.sender.sep12Id } : {}),
+          receiver_id: receiverId,
+          ...(senderId ? { sender_id: senderId } : {}),
           // Payout instructions, keyed by the names the anchor publishes under
           // `fields.transaction` in GET /sep31/info.
           fields: { transaction: intent.destinationFields ?? {} },
